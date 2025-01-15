@@ -8,12 +8,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/diff"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/containerd/containerd/filters"
-	"github.com/containerd/containerd/gc"
-	"github.com/containerd/containerd/leases"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/diff"
+	"github.com/containerd/containerd/v2/core/leases"
+	"github.com/containerd/containerd/v2/pkg/filters"
+	"github.com/containerd/containerd/v2/pkg/gc"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/client"
@@ -21,13 +22,13 @@ import (
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/snapshot"
 	"github.com/moby/buildkit/util/bklog"
+	"github.com/moby/buildkit/util/disk"
 	"github.com/moby/buildkit/util/flightcontrol"
 	"github.com/moby/buildkit/util/progress"
 	digest "github.com/opencontainers/go-digest"
 	imagespecidentity "github.com/opencontainers/image-spec/identity"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -36,6 +37,8 @@ var (
 	errNotFound = errors.New("not found")
 	errInvalid  = errors.New("invalid")
 )
+
+const maxPruneBatch = 10 // maximum number of refs to prune while holding the manager lock
 
 type ManagerOpt struct {
 	Snapshotter     snapshot.Snapshotter
@@ -46,6 +49,7 @@ type ManagerOpt struct {
 	Applier         diff.Applier
 	Differ          diff.Comparer
 	MetadataStore   *metadata.Store
+	Root            string
 	MountPoolRoot   string
 }
 
@@ -91,10 +95,12 @@ type cacheManager struct {
 	Differ          diff.Comparer
 	MetadataStore   *metadata.Store
 
+	root string
+
 	mountPool sharableMountPool
 
 	muPrune sync.Mutex // make sure parallel prune is not allowed so there will not be inconsistent results
-	unlazyG flightcontrol.Group
+	unlazyG flightcontrol.Group[struct{}]
 }
 
 func NewManager(opt ManagerOpt) (Manager, error) {
@@ -107,6 +113,7 @@ func NewManager(opt ManagerOpt) (Manager, error) {
 		Applier:         opt.Applier,
 		Differ:          opt.Differ,
 		MetadataStore:   opt.MetadataStore,
+		root:            opt.Root,
 		records:         make(map[string]*cacheRecord),
 	}
 
@@ -135,7 +142,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 
 	descHandlers := descHandlersOf(opts...)
 	if desc.Digest != "" && (descHandlers == nil || descHandlers[desc.Digest] == nil) {
-		if _, err := cm.ContentStore.Info(ctx, desc.Digest); errors.Is(err, errdefs.ErrNotFound) {
+		if _, err := cm.ContentStore.Info(ctx, desc.Digest); errors.Is(err, cerrdefs.ErrNotFound) {
 			return nil, NeedsRemoteProviderError([]digest.Digest{desc.Digest})
 		} else if err != nil {
 			return nil, err
@@ -166,7 +173,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 	releaseParent := false
 	defer func() {
 		if releaseParent || rerr != nil && p != nil {
-			p.Release(context.TODO())
+			p.Release(context.WithoutCancel(ctx))
 		}
 	}()
 
@@ -222,10 +229,8 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 
 	id := identity.NewID()
 	snapshotID := chainID.String()
-	blobOnly := true
 	if link != nil {
 		snapshotID = link.getSnapshotID()
-		blobOnly = link.getBlobOnly()
 		go link.Release(context.TODO())
 	}
 
@@ -242,10 +247,11 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 
 	defer func() {
 		if rerr != nil {
-			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
+			ctx := context.WithoutCancel(ctx)
+			if err := cm.LeaseManager.Delete(ctx, leases.Lease{
 				ID: l.ID,
 			}); err != nil {
-				logrus.Errorf("failed to remove lease: %+v", err)
+				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
 			}
 		}
 	}()
@@ -253,7 +259,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 	if err := cm.LeaseManager.AddResource(ctx, l, leases.Resource{
 		ID:   snapshotID,
 		Type: "snapshots/" + cm.Snapshotter.Name(),
-	}); err != nil && !errdefs.IsAlreadyExists(err) {
+	}); err != nil && !cerrdefs.IsAlreadyExists(err) {
 		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", id)
 	}
 
@@ -289,7 +295,7 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 	rec.queueChainID(chainID)
 	rec.queueBlobChainID(blobChainID)
 	rec.queueSnapshotID(snapshotID)
-	rec.queueBlobOnly(blobOnly)
+	rec.queueBlobOnly(true)
 	rec.queueMediaType(desc.MediaType)
 	rec.queueBlobSize(desc.Size)
 	rec.appendURLs(desc.URLs)
@@ -301,7 +307,14 @@ func (cm *cacheManager) GetByBlob(ctx context.Context, desc ocispecs.Descriptor,
 
 	cm.records[id] = rec
 
-	return rec.ref(true, descHandlers, nil), nil
+	ref := rec.ref(true, descHandlers, nil)
+	if s := unlazySessionOf(opts...); s != nil {
+		if err := ref.unlazy(ctx, ref.descHandlers, ref.progress, s, true, false); err != nil {
+			return nil, err
+		}
+	}
+
+	return ref, nil
 }
 
 // init loads all snapshots from metadata state and tries to load the records
@@ -314,9 +327,10 @@ func (cm *cacheManager) init(ctx context.Context) error {
 
 	for _, si := range items {
 		if _, err := cm.getRecord(ctx, si.ID()); err != nil {
-			logrus.Debugf("could not load snapshot %s: %+v", si.ID(), err)
+			bklog.G(ctx).Debugf("could not load snapshot %s: %+v", si.ID(), err)
 			cm.MetadataStore.Clear(si.ID())
 			cm.LeaseManager.Delete(ctx, leases.Lease{ID: si.ID()})
+			cm.LeaseManager.Delete(ctx, leases.Lease{ID: si.ID() + "-variants"})
 		}
 	}
 	return nil
@@ -366,7 +380,7 @@ func (cm *cacheManager) get(ctx context.Context, id string, pg progress.Controll
 		if rec.equalImmutable != nil {
 			return rec.equalImmutable.ref(triggerUpdate, descHandlers, pg), nil
 		}
-		return rec.mref(triggerUpdate, descHandlers).commit(ctx)
+		return rec.mref(triggerUpdate, descHandlers).commit()
 	}
 
 	return rec.ref(triggerUpdate, descHandlers, pg), nil
@@ -415,7 +429,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 	}
 	defer func() {
 		if retErr != nil {
-			parents.release(context.TODO())
+			parents.release(context.WithoutCancel(ctx))
 		}
 	}()
 
@@ -476,7 +490,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 	if rec.mutable {
 		// If the record is mutable, then the snapshot must exist
 		if _, err := cm.Snapshotter.Stat(ctx, rec.ID()); err != nil {
-			if !errdefs.IsNotFound(err) {
+			if !cerrdefs.IsNotFound(err) {
 				return nil, errors.Wrap(err, "failed to check mutable ref snapshot")
 			}
 			// the snapshot doesn't exist, clear this record
@@ -505,7 +519,7 @@ func (cm *cacheManager) getRecord(ctx context.Context, id string, opts ...RefOpt
 func (cm *cacheManager) parentsOf(ctx context.Context, md *cacheMetadata, opts ...RefOption) (ps parentRefs, rerr error) {
 	defer func() {
 		if rerr != nil {
-			ps.release(context.TODO())
+			ps.release(context.WithoutCancel(ctx))
 		}
 	}()
 	if parentID := md.getParent(); parentID != "" {
@@ -572,7 +586,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 
 	defer func() {
 		if err != nil && parent != nil {
-			parent.Release(context.TODO())
+			parent.Release(context.WithoutCancel(ctx))
 		}
 	}()
 
@@ -589,10 +603,11 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 
 	defer func() {
 		if err != nil {
-			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
+			ctx := context.WithoutCancel(ctx)
+			if err := cm.LeaseManager.Delete(ctx, leases.Lease{
 				ID: l.ID,
 			}); err != nil {
-				logrus.Errorf("failed to remove lease: %+v", err)
+				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
 			}
 		}
 	}()
@@ -601,7 +616,7 @@ func (cm *cacheManager) New(ctx context.Context, s ImmutableRef, sess session.Gr
 	if err := cm.LeaseManager.AddResource(ctx, l, leases.Resource{
 		ID:   snapshotID,
 		Type: "snapshots/" + cm.Snapshotter.Name(),
-	}); err != nil && !errdefs.IsAlreadyExists(err) {
+	}); err != nil && !cerrdefs.IsAlreadyExists(err) {
 		return nil, errors.Wrapf(err, "failed to add snapshot %s to lease", snapshotID)
 	}
 
@@ -697,7 +712,7 @@ func (cm *cacheManager) Merge(ctx context.Context, inputParents []ImmutableRef, 
 	dhs := make(map[digest.Digest]*DescHandler)
 	defer func() {
 		if rerr != nil {
-			parents.release(context.TODO())
+			parents.release(context.WithoutCancel(ctx))
 		}
 	}()
 	for _, inputParent := range inputParents {
@@ -790,7 +805,8 @@ func (cm *cacheManager) createMergeRef(ctx context.Context, parents parentRefs, 
 	}
 	defer func() {
 		if rerr != nil {
-			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
+			ctx := context.WithoutCancel(ctx)
+			if err := cm.LeaseManager.Delete(ctx, leases.Lease{
 				ID: l.ID,
 			}); err != nil {
 				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
@@ -826,7 +842,7 @@ func (cm *cacheManager) Diff(ctx context.Context, lower, upper ImmutableRef, pg 
 	dhs := make(map[digest.Digest]*DescHandler)
 	defer func() {
 		if rerr != nil {
-			parents.release(context.TODO())
+			parents.release(context.WithoutCancel(ctx))
 		}
 	}()
 	for i, inputParent := range []ImmutableRef{lower, upper} {
@@ -881,7 +897,7 @@ func (cm *cacheManager) Diff(ctx context.Context, lower, upper ImmutableRef, pg 
 			mergeParents := parentRefs{mergeParents: make([]*immutableRef, len(upperLayers)-len(lowerLayers))}
 			defer func() {
 				if rerr != nil {
-					mergeParents.release(context.TODO())
+					mergeParents.release(context.WithoutCancel(ctx))
 				}
 			}()
 			for i := len(lowerLayers); i < len(upperLayers); i++ {
@@ -946,7 +962,8 @@ func (cm *cacheManager) createDiffRef(ctx context.Context, parents parentRefs, d
 	}
 	defer func() {
 		if rerr != nil {
-			if err := cm.LeaseManager.Delete(context.TODO(), leases.Lease{
+			ctx := context.WithoutCancel(ctx)
+			if err := cm.LeaseManager.Delete(ctx, leases.Lease{
 				ID: l.ID,
 			}); err != nil {
 				bklog.G(ctx).Errorf("failed to remove lease: %+v", err)
@@ -1028,7 +1045,7 @@ func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo,
 	}
 
 	totalSize := int64(0)
-	if opt.KeepBytes != 0 {
+	if opt.MaxUsedSpace != 0 || opt.ReservedSpace != 0 || opt.MinFreeSpace != 0 {
 		du, err := cm.DiskUsage(ctx, client.DiskUsageInfo{})
 		if err != nil {
 			return err
@@ -1041,27 +1058,59 @@ func (cm *cacheManager) pruneOnce(ctx context.Context, ch chan client.UsageInfo,
 		}
 	}
 
+	var dstat disk.DiskStat
+	if opt.MinFreeSpace != 0 {
+		dstat, err = disk.GetDiskStat(cm.root)
+		if err != nil {
+			return err
+		}
+	}
+
 	return cm.prune(ctx, ch, pruneOpt{
 		filter:       filter,
 		all:          opt.All,
 		checkShared:  check,
 		keepDuration: opt.KeepDuration,
-		keepBytes:    opt.KeepBytes,
+		keepBytes:    calculateKeepBytes(totalSize, dstat, opt),
 		totalSize:    totalSize,
 	})
 }
 
-func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt pruneOpt) error {
-	var toDelete []*deleteRecord
+func calculateKeepBytes(totalSize int64, dstat disk.DiskStat, opt client.PruneInfo) int64 {
+	// 0 values are special, and means we have no keep cap
+	if opt.MaxUsedSpace == 0 && opt.ReservedSpace == 0 && opt.MinFreeSpace == 0 {
+		return 0
+	}
 
+	// try and keep as many bytes as we can
+	keepBytes := opt.MaxUsedSpace
+
+	// if we need to free up space, then decrease to that
+	if excess := opt.MinFreeSpace - dstat.Free; excess > 0 {
+		if keepBytes == 0 {
+			keepBytes = totalSize - excess
+		} else {
+			keepBytes = min(keepBytes, totalSize-excess)
+		}
+	}
+
+	// but make sure we don't take the total below the reserved space
+	keepBytes = max(keepBytes, opt.ReservedSpace)
+
+	return keepBytes
+}
+
+func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt pruneOpt) (err error) {
 	if opt.keepBytes != 0 && opt.totalSize < opt.keepBytes {
 		return nil
 	}
 
+	var toDelete []*deleteRecord
+
 	cm.mu.Lock()
 
-	gcMode := opt.keepBytes != 0
 	cutOff := time.Now().Add(-opt.keepDuration)
+	gcMode := opt.keepBytes != 0
 
 	locked := map[*sync.Mutex]struct{}{}
 
@@ -1101,10 +1150,11 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 			}
 
 			c := &client.UsageInfo{
-				ID:         cr.ID(),
-				Mutable:    cr.mutable,
-				RecordType: recordType,
-				Shared:     shared,
+				ID:          cr.ID(),
+				Mutable:     cr.mutable,
+				RecordType:  recordType,
+				Shared:      shared,
+				Description: cr.GetDescription(),
 			}
 
 			usageCount, lastUsedAt := cr.getLastUsed()
@@ -1124,48 +1174,49 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 					lastUsedAt:  c.LastUsedAt,
 					usageCount:  c.UsageCount,
 				})
-				if !gcMode {
-					cr.dead = true
-
-					// mark metadata as deleted in case we crash before cleanup finished
-					if err := cr.queueDeleted(); err != nil {
-						cr.mu.Unlock()
-						cm.mu.Unlock()
-						return err
-					}
-					if err := cr.commitMetadata(); err != nil {
-						cr.mu.Unlock()
-						cm.mu.Unlock()
-						return err
-					}
-				} else {
-					locked[cr.mu] = struct{}{}
-					continue // leave the record locked
-				}
+				locked[cr.mu] = struct{}{}
+				continue // leave the record locked
 			}
 		}
 		cr.mu.Unlock()
 	}
 
+	batchSize := len(toDelete)
 	if gcMode && len(toDelete) > 0 {
+		batchSize = 1
 		sortDeleteRecords(toDelete)
-		var err error
-		for i, cr := range toDelete {
-			// only remove single record at a time
-			if i == 0 {
-				cr.dead = true
-				err = cr.queueDeleted()
-				if err == nil {
-					err = cr.commitMetadata()
-				}
-			}
-			cr.mu.Unlock()
-		}
-		if err != nil {
-			return err
-		}
-		toDelete = toDelete[:1]
+	} else if batchSize > maxPruneBatch {
+		batchSize = maxPruneBatch
 	}
+
+	releaseLocks := func() {
+		for _, cr := range toDelete {
+			if !cr.released {
+				cr.released = true
+				cr.mu.Unlock()
+			}
+		}
+		cm.mu.Unlock()
+	}
+
+	for i, cr := range toDelete {
+		// only remove single record at a time
+		if i < batchSize {
+			cr.dead = true
+			// mark metadata as deleted in case we crash before cleanup finished
+			if err := cr.queueDeleted(); err != nil {
+				releaseLocks()
+				return err
+			}
+			if err := cr.commitMetadata(); err != nil {
+				releaseLocks()
+				return err
+			}
+		}
+		cr.mu.Unlock()
+		cr.released = true
+	}
+	toDelete = toDelete[:batchSize]
 
 	cm.mu.Unlock()
 
@@ -1189,7 +1240,6 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 	}
 
 	cm.mu.Lock()
-	var err error
 	for _, cr := range toDelete {
 		cr.mu.Lock()
 
@@ -1250,7 +1300,7 @@ func (cm *cacheManager) prune(ctx context.Context, ch chan client.UsageInfo, opt
 
 	select {
 	case <-ctx.Done():
-		return ctx.Err()
+		return context.Cause(ctx)
 	default:
 		return cm.prune(ctx, ch, opt)
 	}
@@ -1421,12 +1471,13 @@ func (cm *cacheManager) DiskUsage(ctx context.Context, opt client.DiskUsageInfo)
 						d.Size = 0
 						return nil
 					}
+					defer ref.Release(context.TODO())
 					s, err := ref.size(ctx)
 					if err != nil {
 						return err
 					}
 					d.Size = s
-					return ref.Release(context.TODO())
+					return nil
 				})
 			}(d)
 		}
@@ -1596,8 +1647,9 @@ type pruneOpt struct {
 	all          bool
 	checkShared  ExternalRefChecker
 	keepDuration time.Duration
-	keepBytes    int64
-	totalSize    int64
+
+	keepBytes int64
+	totalSize int64
 }
 
 type deleteRecord struct {
@@ -1606,6 +1658,7 @@ type deleteRecord struct {
 	usageCount      int
 	lastUsedAtIndex int
 	usageCountIndex int
+	released        bool
 }
 
 func sortDeleteRecords(toDelete []*deleteRecord) {
@@ -1652,7 +1705,7 @@ func sortDeleteRecords(toDelete []*deleteRecord) {
 }
 
 func diffIDFromDescriptor(desc ocispecs.Descriptor) (digest.Digest, error) {
-	diffIDStr, ok := desc.Annotations["containerd.io/uncompressed"]
+	diffIDStr, ok := desc.Annotations[labels.LabelUncompressed]
 	if !ok {
 		return "", errors.Errorf("missing uncompressed annotation for %s", desc.Digest)
 	}

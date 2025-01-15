@@ -1,15 +1,17 @@
 package dockerfile
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/containerd/continuity/fs/fstest"
 	"github.com/moby/buildkit/client"
-	"github.com/moby/buildkit/frontend/dockerfile/builder"
+	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/util/testutil/integration"
 	"github.com/stretchr/testify/require"
+	"github.com/tonistiigi/fsutil"
 )
 
 var mountTests = integration.TestFuncs(
@@ -24,7 +26,9 @@ var mountTests = integration.TestFuncs(
 	testMountFromError,
 	testMountInvalid,
 	testMountTmpfsSize,
+	testMountDuplicate,
 	testCacheMountUser,
+	testCacheMountParallel,
 )
 
 func init() {
@@ -32,6 +36,7 @@ func init() {
 }
 
 func testMountContext(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -39,27 +44,27 @@ FROM busybox
 RUN --mount=target=/context [ "$(cat /context/testfile)" == "contents0" ]
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 		fstest.CreateFile("testfile", []byte("contents0"), 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
 }
 
 func testMountTmpfs(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -68,26 +73,26 @@ RUN --mount=target=/mytmp,type=tmpfs touch /mytmp/foo
 RUN [ ! -f /mytmp/foo ]
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
 }
 
 func testMountInvalid(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -95,24 +100,23 @@ FROM scratch
 RUN --mont=target=/mytmp,type=tmpfs /bin/true
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "unknown flag: mont")
+	require.Contains(t, err.Error(), "unknown flag: --mont")
 	require.Contains(t, err.Error(), "did you mean mount?")
 
 	dockerfile = []byte(`
@@ -120,16 +124,15 @@ RUN --mont=target=/mytmp,type=tmpfs /bin/true
 	RUN --mount=typ=tmpfs /bin/true
 	`)
 
-	dir, err = integration.Tmpdir(
+	dir = integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.Error(t, err)
@@ -141,16 +144,15 @@ RUN --mont=target=/mytmp,type=tmpfs /bin/true
 	RUN --mount=type=tmp /bin/true
 	`)
 
-	dir, err = integration.Tmpdir(
+	dir = integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.Error(t, err)
@@ -159,6 +161,7 @@ RUN --mont=target=/mytmp,type=tmpfs /bin/true
 }
 
 func testMountRWCache(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -173,12 +176,11 @@ from scratch
 COPY --from=second /unique /unique
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 		fstest.CreateFile("cachebust", []byte("0"), 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -193,9 +195,9 @@ COPY --from=second /unique /unique
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -204,12 +206,11 @@ COPY --from=second /unique /unique
 	require.NoError(t, err)
 
 	// repeat with changed file that should be still cached by content
-	dir, err = integration.Tmpdir(
+	dir = integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 		fstest.CreateFile("cachebust", []byte("1"), 0600),
 	)
-	require.NoError(t, err)
 
 	destDir = t.TempDir()
 
@@ -220,9 +221,9 @@ COPY --from=second /unique /unique
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -233,6 +234,7 @@ COPY --from=second /unique /unique
 }
 
 func testCacheMountUser(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -240,26 +242,26 @@ FROM busybox
 RUN --mount=type=cache,target=/mycache,uid=1001,gid=1002,mode=0751 [ "$(stat -c "%u %g %f" /mycache)" == "1001 1002 41e9" ]
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
 }
 
 func testCacheMountDefaultID(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -269,26 +271,26 @@ RUN --mount=type=cache,target=/mycache2 [ ! -f /mycache2/foo ]
 RUN --mount=type=cache,target=/mycache [ -f /mycache/foo ]
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
 }
 
 func testMountEnvVar(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -298,26 +300,26 @@ RUN --mount=type=cache,target=/mycache touch /mycache/foo
 RUN --mount=type=cache,target=$SOME_PATH [ -f $SOME_PATH/foo ]
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
 }
 
 func testMountArg(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -327,26 +329,26 @@ RUN --mount=type=$MNT_TYPE,target=/mycache2 touch /mycache2/foo
 RUN --mount=type=cache,target=/mycache2 [ -f /mycache2/foo ]
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
 }
 
 func testMountEnvAcrossStages(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -361,26 +363,26 @@ FROM stage1
 RUN --mount=type=$MNT_TYPE2,id=$MNT_ID,target=/whatever [ -f /whatever/foo ]
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
 }
 
 func testMountMetaArg(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -392,26 +394,26 @@ RUN --mount=type=cache,id=mycache,target=/tmp/meta touch /tmp/meta/foo
 RUN --mount=type=cache,id=mycache,target=$META_PATH [ -f /tmp/meta/foo ]
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
 }
 
 func testMountFromError(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -423,20 +425,19 @@ ENV ttt=test
 RUN --mount=from=$ttt,type=cache,target=/tmp ls
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
 	defer c.Close()
 
 	_, err = f.Solve(sb.Context(), c, client.SolveOpt{
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.Error(t, err)
@@ -444,6 +445,7 @@ RUN --mount=from=$ttt,type=cache,target=/tmp ls
 }
 
 func testMountTmpfsSize(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
 	f := getFrontend(t, sb)
 
 	dockerfile := []byte(`
@@ -453,11 +455,10 @@ FROM scratch
 COPY --from=base /tmpfssize /
 `)
 
-	dir, err := integration.Tmpdir(
+	dir := integration.Tmpdir(
 		t,
 		fstest.CreateFile("Dockerfile", dockerfile, 0600),
 	)
-	require.NoError(t, err)
 
 	c, err := client.New(sb.Context(), sb.Address())
 	require.NoError(t, err)
@@ -472,9 +473,9 @@ COPY --from=base /tmpfssize /
 				OutputDir: destDir,
 			},
 		},
-		LocalDirs: map[string]string{
-			builder.DefaultLocalNameDockerfile: dir,
-			builder.DefaultLocalNameContext:    dir,
+		LocalMounts: map[string]fsutil.FS{
+			dockerui.DefaultLocalNameDockerfile: dir,
+			dockerui.DefaultLocalNameContext:    dir,
 		},
 	}, nil)
 	require.NoError(t, err)
@@ -482,4 +483,97 @@ COPY --from=base /tmpfssize /
 	dt, err := os.ReadFile(filepath.Join(destDir, "tmpfssize"))
 	require.NoError(t, err)
 	require.Contains(t, string(dt), `size=131072k`)
+}
+
+// moby/buildkit#4123
+func testMountDuplicate(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM busybox AS base
+RUN --mount=source=.,target=/tmp/test \
+  --mount=source=b.txt,target=/tmp/b.txt \
+  cat /tmp/test/a.txt /tmp/b.txt > /combined.txt
+FROM scratch
+COPY --from=base /combined.txt /
+`)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	destDir := t.TempDir()
+
+	// Run this dockerfile a few times. It should update the context
+	// for a.txt properly and update the output.
+	test := func(text string) {
+		dir := integration.Tmpdir(
+			t,
+			fstest.CreateFile("Dockerfile", dockerfile, 0600),
+			fstest.CreateFile("a.txt", []byte(text), 0600),
+			fstest.CreateFile("b.txt", []byte("bar\n"), 0600),
+		)
+
+		_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+			Exports: []client.ExportEntry{
+				{
+					Type:      client.ExporterLocal,
+					OutputDir: destDir,
+				},
+			},
+			LocalMounts: map[string]fsutil.FS{
+				dockerui.DefaultLocalNameDockerfile: dir,
+				dockerui.DefaultLocalNameContext:    dir,
+			},
+		}, nil)
+		require.NoError(t, err)
+
+		dt, err := os.ReadFile(filepath.Join(destDir, "combined.txt"))
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("%sbar\n", text), string(dt))
+	}
+
+	test("foo\n")
+	test("updated\n")
+}
+
+// moby/buildkit#5566
+func testCacheMountParallel(t *testing.T, sb integration.Sandbox) {
+	integration.SkipOnPlatform(t, "windows")
+	f := getFrontend(t, sb)
+
+	dockerfile := []byte(`
+FROM alpine AS b1
+RUN --mount=type=cache,target=/foo/bar --mount=type=cache,target=/foo/bar/baz echo 1
+
+FROM alpine AS b2
+RUN --mount=type=cache,target=/foo/bar --mount=type=cache,target=/foo/bar/baz echo 2
+
+FROM scratch
+COPY --from=b1 /etc/passwd p1
+COPY --from=b2 /etc/passwd p2
+`)
+
+	dir := integration.Tmpdir(
+		t,
+		fstest.CreateFile("Dockerfile", dockerfile, 0600),
+	)
+
+	c, err := client.New(sb.Context(), sb.Address())
+	require.NoError(t, err)
+	defer c.Close()
+
+	for i := 0; i < 20; i++ {
+		_, err = f.Solve(sb.Context(), c, client.SolveOpt{
+			FrontendAttrs: map[string]string{
+				"no-cache": "",
+			},
+			LocalMounts: map[string]fsutil.FS{
+				dockerui.DefaultLocalNameDockerfile: dir,
+				dockerui.DefaultLocalNameContext:    dir,
+			},
+		}, nil)
+		require.NoError(t, err)
+	}
 }

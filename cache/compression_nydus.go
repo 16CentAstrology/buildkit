@@ -1,45 +1,29 @@
 //go:build nydus
-// +build nydus
 
 package cache
 
 import (
 	"compress/gzip"
 	"context"
-	"encoding/json"
 	"io"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/errdefs"
-	"github.com/moby/buildkit/cache/config"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/labels"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/util/compression"
 	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 
-	nydusify "github.com/containerd/nydus-snapshotter/pkg/converter"
+	"github.com/containerd/nydus-snapshotter/pkg/converter"
 )
 
 func init() {
 	additionalAnnotations = append(
 		additionalAnnotations,
-		nydusify.LayerAnnotationNydusBlob, nydusify.LayerAnnotationNydusBootstrap, nydusify.LayerAnnotationNydusBlobIDs,
+		converter.LayerAnnotationNydusBlob, converter.LayerAnnotationNydusBootstrap,
 	)
-}
-
-// Nydus compression type can't be mixed with other compression types in the same image,
-// so if `source` is this kind of layer, but the target is other compression type, we
-// should do the forced compression.
-func needsForceCompression(ctx context.Context, cs content.Store, source ocispecs.Descriptor, refCfg config.RefConfig) bool {
-	if refCfg.Compression.Force {
-		return true
-	}
-	isNydusBlob, _ := compression.Nydus.Is(ctx, cs, source)
-	if refCfg.Compression.Type == compression.Nydus {
-		return !isNydusBlob
-	}
-	return isNydusBlob
 }
 
 // MergeNydus does two steps:
@@ -58,8 +42,7 @@ func MergeNydus(ctx context.Context, ref ImmutableRef, comp compression.Config, 
 
 	// Extracts nydus bootstrap from nydus format for each layer.
 	var cm *cacheManager
-	layers := []nydusify.Layer{}
-	blobIDs := []string{}
+	layers := []converter.Layer{}
 	for _, ref := range refs {
 		blobDesc, err := getBlobWithCompressionWithRetry(ctx, ref, comp, s)
 		if err != nil {
@@ -73,8 +56,7 @@ func MergeNydus(ctx context.Context, ref ImmutableRef, comp compression.Config, 
 		if cm == nil {
 			cm = ref.cm
 		}
-		blobIDs = append(blobIDs, blobDesc.Digest.Hex())
-		layers = append(layers, nydusify.Layer{
+		layers = append(layers, converter.Layer{
 			Digest:   blobDesc.Digest,
 			ReaderAt: ra,
 		})
@@ -84,7 +66,7 @@ func MergeNydus(ctx context.Context, ref ImmutableRef, comp compression.Config, 
 	pr, pw := io.Pipe()
 	go func() {
 		defer pw.Close()
-		if _, err := nydusify.Merge(ctx, layers, pw, nydusify.MergeOption{
+		if _, err := converter.Merge(ctx, layers, pw, converter.MergeOption{
 			WithTar: true,
 		}); err != nil {
 			pw.CloseWithError(errors.Wrapf(err, "merge nydus bootstrap"))
@@ -110,9 +92,9 @@ func MergeNydus(ctx context.Context, ref ImmutableRef, comp compression.Config, 
 
 	compressedDgst := cw.Digest()
 	if err := cw.Commit(ctx, 0, compressedDgst, content.WithLabels(map[string]string{
-		containerdUncompressed: uncompressedDgst.Digest().String(),
+		labels.LabelUncompressed: uncompressedDgst.Digest().String(),
 	})); err != nil {
-		if !errdefs.IsAlreadyExists(err) {
+		if !cerrdefs.IsAlreadyExists(err) {
 			return nil, errors.Wrap(err, "commit to content store")
 		}
 	}
@@ -125,21 +107,14 @@ func MergeNydus(ctx context.Context, ref ImmutableRef, comp compression.Config, 
 		return nil, errors.Wrap(err, "get info from content store")
 	}
 
-	blobIDsBytes, err := json.Marshal(blobIDs)
-	if err != nil {
-		return nil, errors.Wrap(err, "marshal blob ids")
-	}
-
 	desc := ocispecs.Descriptor{
 		Digest:    compressedDgst,
 		Size:      info.Size,
 		MediaType: ocispecs.MediaTypeImageLayerGzip,
 		Annotations: map[string]string{
-			containerdUncompressed: uncompressedDgst.Digest().String(),
+			labels.LabelUncompressed: uncompressedDgst.Digest().String(),
 			// Use this annotation to identify nydus bootstrap layer.
-			nydusify.LayerAnnotationNydusBootstrap: "true",
-			// Track all blob digests for nydus snapshotter.
-			nydusify.LayerAnnotationNydusBlobIDs: string(blobIDsBytes),
+			converter.LayerAnnotationNydusBootstrap: "true",
 		},
 	}
 

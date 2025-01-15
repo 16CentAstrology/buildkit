@@ -10,6 +10,7 @@ import (
 	"github.com/moby/buildkit/client/llb"
 	"github.com/moby/buildkit/client/llb/imagemetaresolver"
 	"github.com/moby/buildkit/frontend/dockerfile/dockerfile2llb"
+	"github.com/moby/buildkit/frontend/dockerui"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/sirupsen/logrus"
@@ -18,7 +19,7 @@ import (
 type buildOpt struct {
 	target                 string
 	partialImageConfigFile string
-	partialMetadataFile    string
+	baseImageConfigFile    string
 }
 
 func main() {
@@ -31,7 +32,7 @@ func xmain() error {
 	var opt buildOpt
 	flag.StringVar(&opt.target, "target", "", "target stage")
 	flag.StringVar(&opt.partialImageConfigFile, "partial-image-config-file", "", "Output partial image config as a JSON file")
-	flag.StringVar(&opt.partialMetadataFile, "partial-metadata-file", "", "Output partial metadata sa a JSON file")
+	flag.StringVar(&opt.baseImageConfigFile, "base-image-config-file", "", "Output base image config as a JSON file")
 	flag.Parse()
 
 	df, err := io.ReadAll(os.Stdin)
@@ -41,10 +42,12 @@ func xmain() error {
 
 	caps := pb.Caps.CapSet(pb.Caps.All())
 
-	state, img, _, err := dockerfile2llb.Dockerfile2LLB(appcontext.Context(), df, dockerfile2llb.ConvertOpt{
+	state, img, baseImg, _, err := dockerfile2llb.Dockerfile2LLB(appcontext.Context(), df, dockerfile2llb.ConvertOpt{
 		MetaResolver: imagemetaresolver.Default(),
-		Target:       opt.target,
 		LLBCaps:      &caps,
+		Config: dockerui.Config{
+			Target: opt.target,
+		},
 	})
 	if err != nil {
 		return err
@@ -62,6 +65,12 @@ func xmain() error {
 			return err
 		}
 	}
+	if opt.baseImageConfigFile != "" {
+		if err := writeJSON(opt.baseImageConfigFile, baseImg); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 

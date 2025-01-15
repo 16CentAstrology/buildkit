@@ -9,6 +9,7 @@ import (
 
 	intoto "github.com/in-toto/in-toto-golang/in_toto"
 	"github.com/moby/buildkit/client/llb"
+	"github.com/moby/buildkit/client/llb/sourceresolver"
 	gatewaypb "github.com/moby/buildkit/frontend/gateway/pb"
 	"github.com/moby/buildkit/solver/result"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
@@ -31,14 +32,15 @@ const (
 // build-contexts or multi-stage builds. Handling these separately allows the
 // scanner to optionally ignore these or to mark them as such in the
 // attestation.
-type Scanner func(ctx context.Context, name string, ref llb.State, extras map[string]llb.State) (result.Attestation[llb.State], error)
+type Scanner func(ctx context.Context, name string, ref llb.State, extras map[string]llb.State, opts ...llb.ConstraintsOpt) (result.Attestation[*llb.State], error)
 
-func CreateSBOMScanner(ctx context.Context, resolver llb.ImageMetaResolver, scanner string) (Scanner, error) {
+func CreateSBOMScanner(ctx context.Context, resolver sourceresolver.MetaResolver, scanner string, resolveOpt sourceresolver.Opt, params map[string]string) (Scanner, error) {
 	if scanner == "" {
 		return nil, nil
 	}
 
-	_, dt, err := resolver.ResolveImageConfig(ctx, scanner, llb.ResolveImageConfigOpt{})
+	imr := sourceresolver.NewImageMetaResolver(resolver)
+	scanner, _, dt, err := imr.ResolveImageConfig(ctx, scanner, resolveOpt)
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +57,7 @@ func CreateSBOMScanner(ctx context.Context, resolver llb.ImageMetaResolver, scan
 		return nil, errors.Errorf("scanner %s does not have cmd", scanner)
 	}
 
-	return func(ctx context.Context, name string, ref llb.State, extras map[string]llb.State) (result.Attestation[llb.State], error) {
+	return func(ctx context.Context, name string, ref llb.State, extras map[string]llb.State, opts ...llb.ConstraintsOpt) (result.Attestation[*llb.State], error) {
 		var env []string
 		env = append(env, cfg.Config.Env...)
 		env = append(env, "BUILDKIT_SCAN_DESTINATION="+outDir)
@@ -64,28 +66,38 @@ func CreateSBOMScanner(ctx context.Context, resolver llb.ImageMetaResolver, scan
 			env = append(env, "BUILDKIT_SCAN_SOURCE_EXTRAS="+path.Join(srcDir, "extras/"))
 		}
 
-		opts := []llb.RunOption{
-			llb.Dir(cfg.Config.WorkingDir),
-			llb.Args(args),
-			llb.WithCustomName(fmt.Sprintf("[%s] generating sbom using %s", name, scanner)),
-		}
-		for _, e := range env {
-			k, v, _ := strings.Cut(e, "=")
-			opts = append(opts, llb.AddEnv(k, v))
+		for k, v := range params {
+			env = append(env, "BUILDKIT_SCAN_"+k+"="+v)
 		}
 
-		runscan := llb.Image(scanner).Run(opts...)
+		runOpts := []llb.RunOption{
+			llb.WithCustomName(fmt.Sprintf("[%s] generating sbom using %s", name, scanner)),
+		}
+		for _, opt := range opts {
+			runOpts = append(runOpts, opt)
+		}
+		runOpts = append(runOpts, llb.Dir(cfg.Config.WorkingDir))
+		runOpts = append(runOpts, llb.Args(args))
+		for _, e := range env {
+			k, v, _ := strings.Cut(e, "=")
+			runOpts = append(runOpts, llb.AddEnv(k, v))
+		}
+
+		runscan := llb.Image(scanner).Run(runOpts...)
+		runscan.AddMount("/tmp", llb.Scratch(), llb.Tmpfs())
+
 		runscan.AddMount(path.Join(srcDir, "core", CoreSBOMName), ref, llb.Readonly)
 		for k, extra := range extras {
 			runscan.AddMount(path.Join(srcDir, "extras", ExtraSBOMPrefix+k), extra, llb.Readonly)
 		}
 
 		stsbom := runscan.AddMount(outDir, llb.Scratch())
-		return result.Attestation[llb.State]{
-			Kind: gatewaypb.AttestationKindBundle,
-			Ref:  stsbom,
+		return result.Attestation[*llb.State]{
+			Kind: gatewaypb.AttestationKind_Bundle,
+			Ref:  &stsbom,
 			Metadata: map[string][]byte{
-				result.AttestationReasonKey: result.AttestationReasonSBOM,
+				result.AttestationReasonKey: []byte(result.AttestationReasonSBOM),
+				result.AttestationSBOMCore:  []byte(CoreSBOMName),
 			},
 			InToto: result.InTotoAttestation{
 				PredicateType: intoto.PredicateSPDX,
@@ -94,7 +106,7 @@ func CreateSBOMScanner(ctx context.Context, resolver llb.ImageMetaResolver, scan
 	}, nil
 }
 
-func HasSBOM[T any](res *result.Result[T]) bool {
+func HasSBOM[T comparable](res *result.Result[T]) bool {
 	for _, as := range res.Attestations {
 		for _, a := range as {
 			if a.InToto.PredicateType == intoto.PredicateSPDX {

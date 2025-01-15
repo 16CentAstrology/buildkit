@@ -1,12 +1,12 @@
 package build
 
 import (
-	"encoding/csv"
 	"strings"
 
 	"github.com/moby/buildkit/client"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
+	"github.com/tonistiigi/go-csvvalue"
 )
 
 func parseExportCacheCSV(s string) (client.CacheOptionsEntry, error) {
@@ -14,8 +14,7 @@ func parseExportCacheCSV(s string) (client.CacheOptionsEntry, error) {
 		Type:  "",
 		Attrs: map[string]string{},
 	}
-	csvReader := csv.NewReader(strings.NewReader(s))
-	fields, err := csvReader.Read()
+	fields, err := csvvalue.Fields(s, nil)
 	if err != nil {
 		return ex, err
 	}
@@ -51,7 +50,7 @@ func ParseExportCache(exportCaches []string) ([]client.CacheOptionsEntry, error)
 		legacy := !strings.Contains(exportCache, "type=")
 		if legacy {
 			// Deprecated since BuildKit v0.4.0, but no plan to remove: https://github.com/moby/buildkit/pull/2783#issuecomment-1093449772
-			logrus.Warnf("--export-cache <ref> is deprecated. Please use --export-cache type=registry,ref=<ref>,<opt>=<optval>[,<opt>=<optval>] instead")
+			bklog.L.Warnf("--export-cache <ref> is deprecated. Please use --export-cache type=registry,ref=<ref>,<opt>=<optval>[,<opt>=<optval>] instead")
 			exports = append(exports, client.CacheOptionsEntry{
 				Type: "registry",
 				Attrs: map[string]string{

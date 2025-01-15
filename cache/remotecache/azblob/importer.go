@@ -8,17 +8,19 @@ import (
 	"sync"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
-	"github.com/containerd/containerd/content"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/pkg/labels"
 	"github.com/moby/buildkit/cache/remotecache"
 	v1 "github.com/moby/buildkit/cache/remotecache/v1"
 	"github.com/moby/buildkit/session"
 	"github.com/moby/buildkit/solver"
+	"github.com/moby/buildkit/util/bklog"
 	"github.com/moby/buildkit/util/contentutil"
 	"github.com/moby/buildkit/util/progress"
 	"github.com/moby/buildkit/worker"
+	digest "github.com/opencontainers/go-digest"
 	ocispecs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
-	"github.com/sirupsen/logrus"
 	"golang.org/x/sync/errgroup"
 )
 
@@ -92,7 +94,7 @@ func (ci *importer) loadManifest(ctx context.Context, name string) (*v1.CacheCha
 		return nil, err
 	}
 
-	logrus.Debugf("name %s cache with key %s exists = %v", name, key, exists)
+	bklog.G(ctx).Debugf("name %s cache with key %s exists = %v", name, key, exists)
 
 	if !exists {
 		return v1.NewCacheChains(), nil
@@ -113,7 +115,7 @@ func (ci *importer) loadManifest(ctx context.Context, name string) (*v1.CacheCha
 		return nil, errors.WithStack(err)
 	}
 
-	logrus.Debugf("imported config: %s", string(bytes))
+	bklog.G(ctx).Debugf("imported config: %s", string(bytes))
 
 	var config v1.CacheConfig
 	if err := json.Unmarshal(bytes, &config); err != nil {
@@ -147,7 +149,7 @@ func (ci *importer) makeDescriptorProviderPair(l v1.CacheLayer) (*v1.DescriptorP
 	if l.Annotations.DiffID == "" {
 		return nil, errors.Errorf("cache layer with missing diffid")
 	}
-	annotations["containerd.io/uncompressed"] = l.Annotations.DiffID.String()
+	annotations[labels.LabelUncompressed] = l.Annotations.DiffID.String()
 	if !l.Annotations.CreatedAt.IsZero() {
 		txt, err := l.Annotations.CreatedAt.MarshalText()
 		if err != nil {
@@ -161,14 +163,16 @@ func (ci *importer) makeDescriptorProviderPair(l v1.CacheLayer) (*v1.DescriptorP
 		Size:        l.Annotations.Size,
 		Annotations: annotations,
 	}
+	p := &ciProvider{
+		desc:            desc,
+		containerClient: ci.containerClient,
+		Provider:        contentutil.FromFetcher(&fetcher{containerClient: ci.containerClient, config: ci.config}),
+		config:          ci.config,
+	}
 	return &v1.DescriptorProviderPair{
-		Descriptor: desc,
-		Provider: &ciProvider{
-			desc:            desc,
-			containerClient: ci.containerClient,
-			Provider:        contentutil.FromFetcher(&fetcher{containerClient: ci.containerClient, config: ci.config}),
-			config:          ci.config,
-		},
+		Descriptor:   desc,
+		Provider:     p,
+		InfoProvider: p,
 	}, nil
 }
 
@@ -188,7 +192,7 @@ func (f *fetcher) Fetch(ctx context.Context, desc ocispecs.Descriptor) (io.ReadC
 		return nil, errors.Errorf("blob %s not found", desc.Digest)
 	}
 
-	logrus.Debugf("reading layer from cache: %s", key)
+	bklog.G(ctx).Debugf("reading layer from cache: %s", key)
 
 	blobClient, err := f.containerClient.NewBlockBlobClient(key)
 	if err != nil {
@@ -212,28 +216,34 @@ type ciProvider struct {
 	checked         bool
 }
 
-func (p *ciProvider) CheckDescriptor(ctx context.Context, desc ocispecs.Descriptor) error {
-	if desc.Digest != p.desc.Digest {
-		return nil
+func (p *ciProvider) Info(ctx context.Context, dgst digest.Digest) (content.Info, error) {
+	if dgst != p.desc.Digest {
+		return content.Info{}, errors.Errorf("content not found %s", dgst)
 	}
 
 	if p.checked {
-		return nil
+		return content.Info{
+			Digest: p.desc.Digest,
+			Size:   p.desc.Size,
+		}, nil
 	}
 
 	p.checkMutex.Lock()
 	defer p.checkMutex.Unlock()
 
-	key := blobKey(p.config, desc.Digest.String())
+	key := blobKey(p.config, dgst.String())
 	exists, err := blobExists(ctx, p.containerClient, key)
 	if err != nil {
-		return err
+		return content.Info{}, err
 	}
 
 	if !exists {
-		return errors.Errorf("blob %s not found", desc.Digest)
+		return content.Info{}, errors.Errorf("blob %s not found", dgst)
 	}
 
 	p.checked = true
-	return nil
+	return content.Info{
+		Digest: p.desc.Digest,
+		Size:   p.desc.Size,
+	}, nil
 }

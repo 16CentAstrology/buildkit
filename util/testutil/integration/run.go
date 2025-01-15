@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"maps"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -12,11 +13,12 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
 	"github.com/gofrs/flock"
 	"github.com/moby/buildkit/util/appcontext"
 	"github.com/moby/buildkit/util/contentutil"
@@ -35,9 +37,15 @@ func init() {
 // Backend is the minimal interface that describes a testing backend.
 type Backend interface {
 	Address() string
+	DockerAddress() string
 	ContainerdAddress() string
+	DebugAddress() string
+
 	Rootless() bool
+	NetNSDetached() bool
 	Snapshotter() string
+	ExtraEnv() []string
+	Supports(feature string) bool
 }
 
 type Sandbox interface {
@@ -45,6 +53,7 @@ type Sandbox interface {
 
 	Context() context.Context
 	Cmd(...string) *exec.Cmd
+	Logs() map[string]*bytes.Buffer
 	PrintLogs(*testing.T)
 	ClearLogs()
 	NewRegistry() (string, error)
@@ -54,14 +63,16 @@ type Sandbox interface {
 
 // BackendConfig is used to configure backends created by a worker.
 type BackendConfig struct {
-	Logs       map[string]*bytes.Buffer
-	ConfigFile string
+	Logs         map[string]*bytes.Buffer
+	DaemonConfig []ConfigUpdater
 }
 
 type Worker interface {
 	New(context.Context, *BackendConfig) (Backend, func() error, error)
+	Close() error
 	Name() string
 	Rootless() bool
+	NetNSDetached() bool
 }
 
 type ConfigUpdater interface {
@@ -129,9 +140,7 @@ func WithMirroredImages(m map[string]string) TestOpt {
 		if tc.mirroredImages == nil {
 			tc.mirroredImages = map[string]string{}
 		}
-		for k, v := range m {
-			tc.mirroredImages[k] = v
-		}
+		maps.Copy(tc.mirroredImages, m)
 	}
 }
 
@@ -154,18 +163,20 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 		o(&tc)
 	}
 
-	mirror, cleanup, err := runMirror(t, tc.mirroredImages)
-	require.NoError(t, err)
-
-	t.Cleanup(func() { _ = cleanup() })
+	getMirror := lazyMirrorRunnerFunc(t, tc.mirroredImages)
 
 	matrix := prepareValueMatrix(tc)
 
 	list := List()
 	if os.Getenv("BUILDKIT_WORKER_RANDOM") == "1" && len(list) > 0 {
-		rand.Seed(time.Now().UnixNano())
-		list = []Worker{list[rand.Intn(len(list))]} //nolint:gosec // using math/rand is fine in a test utility
+		rng := rand.New(rand.NewSource(time.Now().UnixNano())) //nolint:gosec // using math/rand is fine in a test utility
+		list = []Worker{list[rng.Intn(len(list))]}
 	}
+	t.Cleanup(func() {
+		for _, br := range list {
+			_ = br.Close()
+		}
+	})
 
 	for _, br := range list {
 		for _, tc := range testCases {
@@ -179,13 +190,18 @@ func Run(t *testing.T, testCases []Test, opt ...TestOpt) {
 							t.Skip("rootless")
 						}
 						ctx := appcontext.Context()
-						if !strings.HasSuffix(fn, "NoParallel") {
+						// TODO(profnandaa): to revisit this to allow tests run
+						// in parallel on Windows in a stable way. Is flaky currently.
+						if !strings.HasSuffix(fn, "NoParallel") && runtime.GOOS != "windows" {
 							t.Parallel()
 						}
 						require.NoError(t, sandboxLimiter.Acquire(context.TODO(), 1))
 						defer sandboxLimiter.Release(1)
 
-						sb, closer, err := newSandbox(ctx, br, mirror, mv)
+						ctx, cancel := context.WithCancelCause(ctx)
+						defer func() { cancel(errors.WithStack(context.Canceled)) }()
+
+						sb, closer, err := newSandbox(ctx, t, br, getMirror(), mv)
 						require.NoError(t, err)
 						t.Cleanup(func() { _ = closer() })
 						defer func() {
@@ -223,6 +239,11 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 		}
 		localImageCache[host][to] = struct{}{}
 
+		// already exists check
+		if _, _, err := docker.NewResolver(docker.ResolverOptions{}).Resolve(context.TODO(), host+"/"+to); err == nil {
+			continue
+		}
+
 		var desc ocispecs.Descriptor
 		var provider content.Provider
 		var err error
@@ -242,12 +263,6 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 			}
 		}
 
-		// already exists check
-		_, _, err = docker.NewResolver(docker.ResolverOptions{}).Resolve(context.TODO(), host+"/"+to)
-		if err == nil {
-			continue
-		}
-
 		ingester, err := contentutil.IngesterFromRef(host + "/" + to)
 		if err != nil {
 			return err
@@ -261,17 +276,7 @@ func copyImagesLocal(t *testing.T, host string, images map[string]string) error 
 }
 
 func OfficialImages(names ...string) map[string]string {
-	ns := runtime.GOARCH
-	if ns == "arm64" {
-		ns = "arm64v8"
-	} else if ns != "amd64" && ns != "armhf" {
-		ns = "library"
-	}
-	m := map[string]string{}
-	for _, name := range names {
-		m["library/"+name] = "docker.io/" + ns + "/" + name
-	}
-	return m
+	return officialImages(names...)
 }
 
 func withMirrorConfig(mirror string) ConfigUpdater {
@@ -288,7 +293,7 @@ mirrors=["%s"]
 `, in, mc)
 }
 
-func writeConfig(updaters []ConfigUpdater) (string, error) {
+func WriteConfig(updaters []ConfigUpdater) (string, error) {
 	tmpdir, err := os.MkdirTemp("", "bktest_config")
 	if err != nil {
 		return "", err
@@ -305,7 +310,21 @@ func writeConfig(updaters []ConfigUpdater) (string, error) {
 	if err := os.WriteFile(filepath.Join(tmpdir, buildkitdConfigFile), []byte(s), 0644); err != nil {
 		return "", err
 	}
-	return tmpdir, nil
+	return filepath.Join(tmpdir, buildkitdConfigFile), nil
+}
+
+func lazyMirrorRunnerFunc(t *testing.T, images map[string]string) func() string {
+	var once sync.Once
+	var mirror string
+	return func() string {
+		once.Do(func() {
+			host, cleanup, err := runMirror(t, images)
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = cleanup() })
+			mirror = host
+		})
+		return mirror
+	}
 }
 
 func runMirror(t *testing.T, mirroredImages map[string]string) (host string, _ func() error, err error) {
@@ -313,6 +332,9 @@ func runMirror(t *testing.T, mirroredImages map[string]string) (host string, _ f
 
 	var lock *flock.Flock
 	if mirrorDir != "" {
+		if err := os.MkdirAll(mirrorDir, 0700); err != nil {
+			return "", nil, err
+		}
 		lock = flock.New(filepath.Join(mirrorDir, "lock"))
 		if err := lock.Lock(); err != nil {
 			return "", nil, err
@@ -393,9 +415,7 @@ func prepareValueMatrix(tc testConf) []matrixValue {
 			for _, c := range current {
 				vv := newMatrixValue(featureName, featureValue, v)
 				vv.fn = append(vv.fn, c.fn...)
-				for k, v := range c.values {
-					vv.values[k] = v
-				}
+				maps.Copy(vv.values, c.values)
 				m = append(m, vv)
 			}
 		}
@@ -406,43 +426,28 @@ func prepareValueMatrix(tc testConf) []matrixValue {
 	return m
 }
 
-func runStargzSnapshotter(cfg *BackendConfig) (address string, cl func() error, err error) {
-	binary := "containerd-stargz-grpc"
-	if err := lookupBinary(binary); err != nil {
-		return "", nil, err
+// Skips tests on platform
+func SkipOnPlatform(t *testing.T, goos string) {
+	skip := false
+	// support for negation
+	if strings.HasPrefix(goos, "!") {
+		goos = strings.TrimPrefix(goos, "!")
+		skip = runtime.GOOS != goos
+	} else {
+		skip = runtime.GOOS == goos
 	}
 
-	deferF := &multiCloser{}
-	cl = deferF.F()
-
-	defer func() {
-		if err != nil {
-			deferF.F()()
-			cl = nil
-		}
-	}()
-
-	tmpStargzDir, err := os.MkdirTemp("", "bktest_containerd_stargz_grpc")
-	if err != nil {
-		return "", nil, err
+	if skip {
+		t.Skipf("Skipped on %s", goos)
 	}
-	deferF.append(func() error { return os.RemoveAll(tmpStargzDir) })
+}
 
-	address = filepath.Join(tmpStargzDir, "containerd-stargz-grpc.sock")
-	stargzRootDir := filepath.Join(tmpStargzDir, "root")
-	cmd := exec.Command(binary,
-		"--log-level", "debug",
-		"--address", address,
-		"--root", stargzRootDir)
-	snStop, err := startCmd(cmd, cfg.Logs)
-	if err != nil {
-		return "", nil, err
+// Selects between two types, returns second
+// argument if on Windows or else first argument.
+// Typically used for selecting test cases.
+func UnixOrWindows[T any](unix, windows T) T {
+	if runtime.GOOS == "windows" {
+		return windows
 	}
-	if err = waitUnix(address, 10*time.Second); err != nil {
-		snStop()
-		return "", nil, errors.Wrapf(err, "containerd-stargz-grpc did not start up: %s", formatLogs(cfg.Logs))
-	}
-	deferF.append(snStop)
-
-	return
+	return unix
 }

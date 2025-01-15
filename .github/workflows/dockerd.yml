@@ -7,79 +7,71 @@ on:
       version:
         description: 'Docker version'
         required: true
-        default: '20.10.19'
+        default: '25.0.2'
 
 env:
-  REPO_SLUG_ORIGIN: "moby/buildkit:latest"
-  CACHE_GHA_SCOPE_IT: "integration-tests"
-  CACHE_GHA_SCOPE_BINARIES: "binaries"
+  SETUP_BUILDX_VERSION: "edge"
+  SETUP_BUILDKIT_IMAGE: "moby/buildkit:latest"
   TESTFLAGS: "-v --parallel=1 --timeout=30m"
-  BUILDX_VERSION: "v0.9.1"  # leave empty to use the one available on GitHub virtual environment
 
 jobs:
   prepare:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     steps:
       -
-        name: Check version
-        run: |
-          version=${{ github.event.inputs.version }}
-          if [ -z "$version" ]; then
-            version=20.10.19
-          fi
-          echo "DOCKER_VERSION=$version" >> $GITHUB_ENV
-      -
-        name: Check build
-        uses: actions/github-script@v6
-        id: build
+        name: Prepare
+        uses: actions/github-script@v7
         with:
-          result-encoding: string
           script: |
+            const version = `${{ inputs.version }}` || '25.0.2';
+            let build = 'true';
             try {
-              new URL("${{ env.DOCKER_VERSION }}");
+              new URL(version);
             } catch (e) {
-              return false;
+              build = 'false';
             }
-            return true;
+            core.exportVariable('DOCKER_VERSION', version);
+            core.exportVariable('DOCKER_BUILD', build);
       -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
         with:
-          version: ${{ env.BUILDX_VERSION }}
-          driver-opts: image=${{ env.REPO_SLUG_ORIGIN }}
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
           buildkitd-flags: --debug
       -
         name: Build
-        if: steps.build.outputs.result == 'true'
-        uses: docker/build-push-action@v3
+        if: ${{ env.DOCKER_BUILD == 'true' }}
+        uses: docker/build-push-action@v6
         with:
           context: ${{ env.DOCKER_VERSION }}
           target: binary
           outputs: /tmp/moby
       -
         name: Rename binary
-        if: steps.build.outputs.result == 'true'
+        if: ${{ env.DOCKER_BUILD == 'true' }}
         run: |
           if [ -L "/tmp/moby/binary-daemon/dockerd" ]; then
-            mv -f $(readlink /tmp/moby/binary-daemon/dockerd) /tmp/moby/binary-daemon/dockerd
+            mv -f $(readlink /tmp/moby/binary-daemon/dockerd) /tmp/moby/dockerd
           fi
       -
         name: Download
-        if: steps.build.outputs.result != 'true'
+        if: ${{ env.DOCKER_BUILD != 'true' }}
         run: |
-          mkdir -p /tmp/moby/binary-daemon
-          cd /tmp/moby/binary-daemon
+          mkdir -p /tmp/moby
+          cd /tmp/moby
           wget -qO- "https://download.docker.com/linux/static/stable/x86_64/docker-${{ env.DOCKER_VERSION }}.tgz" | tar xvz --strip 1
       -
         name: Upload dockerd
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: dockerd
-          path: /tmp/moby/binary-daemon/dockerd
+          path: /tmp/moby/dockerd
           if-no-files-found: error
+          retention-days: 1
 
   test:
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-24.04
     needs:
       - prepare
     strategy:
@@ -102,23 +94,23 @@ jobs:
     steps:
       -
         name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
       -
         name: Expose GitHub Runtime
-        uses: crazy-max/ghaction-github-runtime@v2
+        uses: crazy-max/ghaction-github-runtime@v3
       -
         name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
+        uses: docker/setup-qemu-action@v3
       -
         name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v2
+        uses: docker/setup-buildx-action@v3
         with:
-          version: ${{ env.BUILDX_VERSION }}
-          driver-opts: image=${{ env.REPO_SLUG_ORIGIN }}
+          version: ${{ env.SETUP_BUILDX_VERSION }}
+          driver-opts: image=${{ env.SETUP_BUILDKIT_IMAGE }}
           buildkitd-flags: --debug
       -
         name: Download dockerd
-        uses: actions/download-artifact@v3
+        uses: actions/download-artifact@v4
         with:
           name: dockerd
           path: ./build/
@@ -136,4 +128,7 @@ jobs:
           TESTPKGS: "${{ matrix.pkg }}"
           TESTFLAGS: "${{ env.TESTFLAGS }} --run=//worker=${{ matrix.worker }}$"
           SKIP_INTEGRATION_TESTS: "${{ matrix.skip-integration-tests }}"
-          CACHE_FROM: "type=gha,scope=${{ env.CACHE_GHA_SCOPE_IT }} type=gha,scope=${{ env.CACHE_GHA_SCOPE_BINARIES }}"
+          CACHE_FROM: "type=gha,scope=build-integration-tests"
+          BUILDKIT_INTEGRATION_DOCKERD_FLAGS: |
+            --bip=10.66.66.1/24
+            --default-address-pool=base=10.66.66.0/16,size=24

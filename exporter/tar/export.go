@@ -3,11 +3,11 @@ package local
 import (
 	"context"
 	"os"
-	"strconv"
 	"strings"
 	"time"
 
 	"github.com/moby/buildkit/cache"
+	"github.com/moby/buildkit/client"
 	"github.com/moby/buildkit/exporter"
 	"github.com/moby/buildkit/exporter/containerimage/exptypes"
 	"github.com/moby/buildkit/exporter/local"
@@ -18,15 +18,6 @@ import (
 	"github.com/pkg/errors"
 	"github.com/tonistiigi/fsutil"
 	fstypes "github.com/tonistiigi/fsutil/types"
-)
-
-const (
-	attestationPrefixKey = "attestation-prefix"
-
-	// preferNondistLayersKey is an exporter option which can be used to mark a layer as non-distributable if the layer reference was
-	// already found to use a non-distributable media type.
-	// When this option is not set, the exporter will change the media type of the layer to a distributable one.
-	preferNondistLayersKey = "prefer-nondist-layers"
 )
 
 type Opt struct {
@@ -43,46 +34,50 @@ func New(opt Opt) (exporter.Exporter, error) {
 	return le, nil
 }
 
-func (e *localExporter) Resolve(ctx context.Context, opt map[string]string) (exporter.ExporterInstance, error) {
-	li := &localExporterInstance{localExporter: e}
-
-	tm, opt, err := epoch.ParseExporterAttrs(opt)
+func (e *localExporter) Resolve(ctx context.Context, id int, opt map[string]string) (exporter.ExporterInstance, error) {
+	li := &localExporterInstance{
+		localExporter: e,
+		id:            id,
+		attrs:         opt,
+	}
+	_, err := li.opts.Load(opt)
 	if err != nil {
 		return nil, err
 	}
-	li.opts.Epoch = tm
-
-	for k, v := range opt {
-		switch k {
-		case preferNondistLayersKey:
-			b, err := strconv.ParseBool(v)
-			if err != nil {
-				return nil, errors.Wrapf(err, "non-bool value for %s: %s", preferNondistLayersKey, v)
-			}
-			li.preferNonDist = b
-		case attestationPrefixKey:
-			li.opts.AttestationPrefix = v
-		}
-	}
+	_ = opt
 
 	return li, nil
 }
 
 type localExporterInstance struct {
 	*localExporter
-	opts          local.CreateFSOpts
-	preferNonDist bool
+	id    int
+	attrs map[string]string
+
+	opts local.CreateFSOpts
+}
+
+func (e *localExporterInstance) ID() int {
+	return e.id
 }
 
 func (e *localExporterInstance) Name() string {
 	return "exporting to client tarball"
 }
 
+func (e *localExporterInstance) Type() string {
+	return client.ExporterTar
+}
+
+func (e *localExporterInstance) Attrs() map[string]string {
+	return e.attrs
+}
+
 func (e *localExporterInstance) Config() *exporter.Config {
 	return exporter.NewConfig()
 }
 
-func (e *localExporterInstance) Export(ctx context.Context, inp *exporter.Source, sessionID string) (map[string]string, exporter.DescriptorReference, error) {
+func (e *localExporterInstance) Export(ctx context.Context, inp *exporter.Source, _ exptypes.InlineCache, sessionID string) (map[string]string, exporter.DescriptorReference, error) {
 	var defers []func() error
 
 	defer func() {
@@ -110,9 +105,9 @@ func (e *localExporterInstance) Export(ctx context.Context, inp *exporter.Source
 			defers = append(defers, cleanup)
 		}
 
-		st := fstypes.Stat{
+		st := &fstypes.Stat{
 			Mode: uint32(os.ModeDir | 0755),
-			Path: strings.Replace(k, "/", "_", -1),
+			Path: strings.ReplaceAll(k, "/", "_"),
 		}
 		if e.opts.Epoch != nil {
 			st.ModTime = e.opts.Epoch.UnixNano()
@@ -168,20 +163,21 @@ func (e *localExporterInstance) Export(ctx context.Context, inp *exporter.Source
 		fs = d.FS
 	}
 
-	timeoutCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
+	timeoutCtx, cancel := context.WithCancelCause(ctx)
+	timeoutCtx, _ = context.WithTimeoutCause(timeoutCtx, 5*time.Second, errors.WithStack(context.DeadlineExceeded))
+	defer func() { cancel(errors.WithStack(context.Canceled)) }()
 
 	caller, err := e.opt.SessionManager.Get(timeoutCtx, sessionID, false)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	w, err := filesync.CopyFileWriter(ctx, nil, caller)
+	w, err := filesync.CopyFileWriter(ctx, nil, e.id, caller)
 	if err != nil {
 		return nil, nil, err
 	}
 	report := progress.OneOff(ctx, "sending tarball")
-	if err := fsutil.WriteTar(ctx, fs, w); err != nil {
+	if err := writeTar(ctx, fs, w); err != nil {
 		w.Close()
 		return nil, nil, report(err)
 	}

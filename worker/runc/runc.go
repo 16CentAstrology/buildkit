@@ -1,3 +1,5 @@
+//go:build linux
+
 package runc
 
 import (
@@ -6,16 +8,17 @@ import (
 	"path/filepath"
 	"strconv"
 
-	"github.com/containerd/containerd/content/local"
-	"github.com/containerd/containerd/diff/apply"
-	"github.com/containerd/containerd/diff/walking"
-	ctdmetadata "github.com/containerd/containerd/metadata"
-	"github.com/containerd/containerd/platforms"
-	ctdsnapshot "github.com/containerd/containerd/snapshots"
+	"github.com/containerd/containerd/v2/core/diff/apply"
+	ctdmetadata "github.com/containerd/containerd/v2/core/metadata"
+	ctdsnapshot "github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/plugins/content/local"
+	"github.com/containerd/containerd/v2/plugins/diff/walking"
+	"github.com/containerd/platforms"
 	"github.com/docker/docker/pkg/idtools"
 	"github.com/moby/buildkit/cache"
 	"github.com/moby/buildkit/cache/metadata"
 	"github.com/moby/buildkit/executor/oci"
+	"github.com/moby/buildkit/executor/resources"
 	"github.com/moby/buildkit/executor/runcexecutor"
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/util/leaseutil"
@@ -54,6 +57,11 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		cmds = append(cmds, binary)
 	}
 
+	rm, err := resources.NewMonitor()
+	if err != nil {
+		return opt, err
+	}
+
 	exe, err := runcexecutor.New(runcexecutor.Opt{
 		// Root directory
 		Root: filepath.Join(root, "executor"),
@@ -69,6 +77,7 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		SELinux:             selinux,
 		TracingSocket:       traceSocket,
 		DefaultCgroupParent: defaultCgroupParent,
+		ResourceMonitor:     rm,
 	}, np)
 	if err != nil {
 		return opt, err
@@ -78,7 +87,7 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		return opt, err
 	}
 
-	c, err := local.NewStore(filepath.Join(root, "content"))
+	localstore, err := local.NewStore(filepath.Join(root, "content"))
 	if err != nil {
 		return opt, err
 	}
@@ -88,14 +97,14 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		return opt, err
 	}
 
-	mdb := ctdmetadata.NewDB(db, c, map[string]ctdsnapshot.Snapshotter{
+	mdb := ctdmetadata.NewDB(db, localstore, map[string]ctdsnapshot.Snapshotter{
 		snFactory.Name: s,
 	})
 	if err := mdb.Init(context.TODO()); err != nil {
 		return opt, err
 	}
 
-	c = containerdsnapshot.NewContentStore(mdb.ContentStore(), "buildkit")
+	c := containerdsnapshot.NewContentStore(mdb.ContentStore(), "buildkit")
 
 	id, err := base.ID(root)
 	if err != nil {
@@ -122,7 +131,6 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 	}
 	lm := leaseutil.WithNamespace(ctdmetadata.NewLeaseManager(mdb), "buildkit")
 	snap := containerdsnapshot.NewSnapshotter(snFactory.Name, mdb.Snapshotter(snFactory.Name), "buildkit", idmap)
-
 	if err := cache.MigrateV2(
 		context.TODO(),
 		filepath.Join(root, "metadata.db"),
@@ -141,6 +149,7 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 
 	opt = base.WorkerOpt{
 		ID:               id,
+		Root:             root,
 		Labels:           xlabels,
 		MetadataStore:    md,
 		NetworkProviders: np,
@@ -156,6 +165,7 @@ func NewWorkerOpt(root string, snFactory SnapshotterFactory, rootless bool, proc
 		GarbageCollect:   mdb.GarbageCollect,
 		ParallelismSem:   parallelismSem,
 		MountPoolRoot:    filepath.Join(root, "cachemounts"),
+		ResourceMonitor:  rm,
 	}
 	return opt, nil
 }
